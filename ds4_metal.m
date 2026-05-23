@@ -104,6 +104,8 @@ static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
+static id<MTLComputePipelineState> g_q8_to_i8_step1_pipeline;
+static id<MTLComputePipelineState> g_q8_to_i8_step2_pipeline;
 
 // Q8_0 → plain INT8 weight shadow table (for ANE INT8 matmul).
 // Populated by ds4_gpu_cache_q8_i8_range() at model load time.
@@ -115,6 +117,15 @@ static struct {
     float         scale;
 } g_q8_i8_shadows[4096];
 static int g_n_q8_i8_shadows;
+
+// Expert tensor shadow (3D Q2_K → flat INT8 per expert).
+static struct {
+    uint64_t      base_offset;   // tensor abs_offset
+    id<MTLBuffer> i8_buf;        // all experts concatenated
+    float        *scale;         // scale[256], CPU-allocated (leaked)
+    uint64_t      expert_bytes;  // bytes per expert in i8_buf
+} g_expert_shadows[6];
+static int g_n_expert_shadows;
 
 // ANE batch encoder globals — reused across matmuls within one layer.
 // Created by ds4_gpu_ane_batch_begin(), dispatched by _add(), committed by _end().
@@ -1544,6 +1555,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_DEQUANT_SOURCE",    @"metal/dequant.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -4139,6 +4151,10 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
         g_dsv4_hc_expand4_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4");
+        g_q8_to_i8_step1_pipeline =
+            ds4_gpu_get_pipeline("kernel_q8_to_i8_step1");
+        g_q8_to_i8_step2_pipeline =
+            ds4_gpu_get_pipeline("kernel_q8_to_i8_step2");
         if (!g_dsv4_indexer_score_one_direct_pipeline ||
             !g_dsv4_compressor_store_one_pipeline ||
             !g_dsv4_sort_i32_rows_asc_pipeline ||
@@ -15075,65 +15091,62 @@ int ds4_gpu_cache_q8_i8_range(
     if (!model_map || !bytes) return 1;
     if ((in_dim & 31u) != 0 || in_dim == 0 || out_dim == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
+    if (!g_q8_to_i8_step1_pipeline || !g_q8_to_i8_step2_pipeline) return 1;
 
     (void)label;
 
-    // Box the model bytes through a model view so we operate inside the
-    // mapped region.  The buffer may be GPU-resident but is
-    // MTLStorageModeShared, so CPU reads are legal (uncached but correct).
+    const uint64_t elements = in_dim * out_dim;
+    const uint64_t blocks   = in_dim / 32u;
+    const uint64_t n_blocks_total = out_dim * blocks;
+
     uint64_t inner_offset = 0;
     id<MTLBuffer> src_buf = ds4_gpu_wrap_model_range(model_map, model_size,
                                                       offset, bytes, &inner_offset);
     if (!src_buf) return 0;
 
-    const uint64_t elements = in_dim * out_dim;
-    const uint64_t blocks   = in_dim / 32u;
-
-    // Allocate plain INT8 buffer (1 byte per element).
     id<MTLBuffer> i8_buf = [g_device newBufferWithLength:(NSUInteger)elements
                                                   options:MTLResourceStorageModeShared];
     if (!i8_buf) return 0;
-    int8_t *dst = (int8_t *)[i8_buf contents];
-    if (!dst) return 0;
 
-    // --- Pass 1: read Q8_0 blocks, find max |value| ---
-    const uint8_t *src_bytes = (const uint8_t *)model_map + offset;
-    float max_abs = 1e-8f;
+    // --- GPU Pass 1: find per-block max_abs ---
+    id<MTLBuffer> absmax_buf = [g_device newBufferWithLength:(NSUInteger)(n_blocks_total * sizeof(float))
+                                                      options:MTLResourceStorageModeShared];
+    if (!absmax_buf) return 0;
 
-    // We do this CPU-side because the conversion is one-shot and
-    // the model map is MTLStorageModeShared (readable from CPU).
-    for (uint64_t row = 0; row < out_dim; row++) {
-        const uint64_t row_off = row * blocks * 34u;
-        for (uint64_t blk = 0; blk < blocks; blk++) {
-            const uint8_t *b = src_bytes + row_off + blk * 34u;
-            float d;
-            memcpy(&d, b, sizeof(uint16_t));  // half
-            for (uint32_t j = 0; j < 32u; j++) {
-                float v = (float)(int8_t)b[2u + j] * d;
-                float abs_v = v < 0 ? -v : v;
-                if (abs_v > max_abs) max_abs = abs_v;
-            }
-        }
+    {
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_q8_to_i8_step1_pipeline];
+        [enc setBuffer:src_buf     offset:(NSUInteger)inner_offset atIndex:0];
+        [enc setBuffer:absmax_buf  offset:0 atIndex:1];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_blocks_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
     }
 
-    // --- Pass 2: requantize to plain INT8 ---
+    // --- CPU reduction: find global max_abs ---
+    const float *am = (const float *)[absmax_buf contents];
+    float max_abs = 1e-8f;
+    for (uint64_t i = 0; i < n_blocks_total; i++) {
+        if (am[i] > max_abs) max_abs = am[i];
+    }
     float single_scale = max_abs / 127.0f;
-    float inv_scale = 1.0f / single_scale;
 
-    for (uint64_t row = 0; row < out_dim; row++) {
-        const uint64_t row_off = row * blocks * 34u;
-        for (uint64_t blk = 0; blk < blocks; blk++) {
-            const uint8_t *b = src_bytes + row_off + blk * 34u;
-            float d;
-            memcpy(&d, b, sizeof(uint16_t));
-            for (uint32_t j = 0; j < 32u; j++) {
-                float v = (float)(int8_t)b[2u + j] * d;
-                int val = (int)(v * inv_scale + (v >= 0 ? 0.5f : -0.5f));
-                if (val > 127) val = 127;
-                if (val < -128) val = -128;
-                dst[row * in_dim + blk * 32u + j] = (int8_t)val;
-            }
-        }
+    // --- GPU Pass 2: requantize to INT8 ---
+    {
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_q8_to_i8_step2_pipeline];
+        [enc setBuffer:src_buf     offset:(NSUInteger)inner_offset atIndex:0];
+        [enc setBuffer:i8_buf      offset:0 atIndex:1];
+        [enc setBytes:&single_scale length:sizeof(float) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_blocks_total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
     }
 
     if (g_n_q8_i8_shadows < (int)(sizeof(g_q8_i8_shadows) / sizeof(g_q8_i8_shadows[0]))) {
@@ -15144,6 +15157,136 @@ int ds4_gpu_cache_q8_i8_range(
     }
     return 1;
 }
+
+static inline float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x03ff;
+    if (exp == 0) {
+        if (mant == 0) { uint32_t bits = sign; return *(float *)&bits; }
+        exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; }
+        mant &= 0x3ff;
+    }
+    exp += 112;
+    uint32_t bits = sign | (exp << 23) | (mant << 13);
+    return *(float *)&bits;
+}
+
+// ds4_gpu_cache_expert_i8_range — convert one 3D Q2_K expert tensor
+// (256 experts × in_dim × out_dim) to flat INT8 with per-expert scale.
+// Called once per tensor (gate/up/down) at model load.
+int ds4_gpu_cache_expert_i8_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    bytes,
+        uint64_t    in_dim,
+        uint64_t    out_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || !bytes) return 1;
+    if ((in_dim & 255u) != 0 || in_dim < 256 || out_dim < 1) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+
+    // Expert format is Q2_K: 84 bytes per 256-element block.
+    const uint64_t blocks_per_row = in_dim / 256u;
+    const uint64_t row_bytes      = blocks_per_row * 84u;
+    const uint64_t n_expert       = bytes / (out_dim * row_bytes);
+    if (n_expert == 0 || n_expert > 256) return 1;
+
+    const uint64_t one_expert_elements = in_dim * out_dim;
+    const uint64_t all_elements        = n_expert * one_expert_elements;
+
+    // Allocate one big INT8 buffer for all experts.
+    id<MTLBuffer> i8_buf = [g_device newBufferWithLength:(NSUInteger)all_elements
+                                                  options:MTLResourceStorageModeShared];
+    if (!i8_buf) return 0;
+    int8_t *i8_ptr = (int8_t *)[i8_buf contents];
+    if (!i8_ptr) return 0;
+
+    float *scales = malloc((size_t)n_expert * sizeof(float));
+    if (!scales) return 0;
+
+    const uint8_t *src = (const uint8_t *)model_map + offset;
+
+    for (uint64_t e = 0; e < n_expert; e++) {
+        const uint8_t *expert_src = src + e * out_dim * row_bytes;
+        int8_t *expert_dst = i8_ptr + e * one_expert_elements;
+
+        // --- Pass 1: dequantize Q2_K blocks, find max |value| ---
+        float max_abs = 1e-8f;
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const uint8_t *row_src = expert_src + row * row_bytes;
+            for (uint64_t blk = 0; blk < blocks_per_row; blk++) {
+                const uint8_t *b = row_src + blk * 84u;
+                uint16_t d_u16; memcpy(&d_u16, b + 64, 2);
+                float d   = f16_to_f32(d_u16);
+                uint16_t dm_u16; memcpy(&dm_u16, b + 66, 2);
+                float dmin = f16_to_f32(dm_u16);
+
+                for (int il = 0; il < 16; il++) {
+                    uint8_t sc_byte = b[il];
+                    const uint8_t *q_part = b + 16 + 32*(il/8) + 16*(il&1);
+                    int il2 = (il/2)%4;
+                    float coef = il2>1 ? (il2>2 ? 1.0f/64.0f : 1.0f/16.0f)
+                                       : (il2>0 ? 1.0f/4.0f : 1.0f);
+                    uint8_t mask = il2>1 ? (il2>2 ? 192 : 48) : (il2>0 ? 12 : 3);
+                    float dl = d * (sc_byte & 0xF) * coef;
+                    float ml = dmin * (sc_byte >> 4);
+                    for (int i = 0; i < 16; i++) {
+                        float v = dl * (q_part[i] & mask) - ml;
+                        if (v < 0) v = -v;
+                        if (v > max_abs) max_abs = v;
+                    }
+                }
+            }
+        }
+
+        // --- Pass 2: requantize ---
+        float single_scale = max_abs / 127.0f;
+        float inv = 1.0f / single_scale;
+        scales[e] = single_scale;
+
+        uint64_t elem_idx = 0;
+        for (uint64_t row = 0; row < out_dim; row++) {
+            const uint8_t *row_src = expert_src + row * row_bytes;
+            for (uint64_t blk = 0; blk < blocks_per_row; blk++) {
+                const uint8_t *b = row_src + blk * 84u;
+                uint16_t d_u16; memcpy(&d_u16, b + 64, 2);
+                float d   = f16_to_f32(d_u16);
+                uint16_t dm_u16; memcpy(&dm_u16, b + 66, 2);
+                float dmin = f16_to_f32(dm_u16);
+
+                for (int il = 0; il < 16; il++) {
+                    uint8_t sc_byte = b[il];
+                    const uint8_t *q_part = b + 16 + 32*(il/8) + 16*(il&1);
+                    int il2 = (il/2)%4;
+                    float coef = il2>1 ? (il2>2 ? 1.0f/64.0f : 1.0f/16.0f)
+                                       : (il2>0 ? 1.0f/4.0f : 1.0f);
+                    uint8_t mask = il2>1 ? (il2>2 ? 192 : 48) : (il2>0 ? 12 : 3);
+                    float dl = d * (sc_byte & 0xF) * coef;
+                    float ml = dmin * (sc_byte >> 4);
+                    for (int i = 0; i < 16; i++) {
+                        float v = dl * (q_part[i] & mask) - ml;
+                        int val = (int)(v * inv + (v >= 0 ? 0.5f : -0.5f));
+                        if (val > 127) val = 127;
+                        if (val < -128) val = -128;
+                        expert_dst[elem_idx++] = (int8_t)val;
+                    }
+                }
+            }
+        }
+    }
+
+    if (g_n_expert_shadows < (int)(sizeof(g_expert_shadows) / sizeof(g_expert_shadows[0]))) {
+        g_expert_shadows[g_n_expert_shadows].base_offset   = offset;
+        g_expert_shadows[g_n_expert_shadows].i8_buf        = i8_buf;
+        g_expert_shadows[g_n_expert_shadows].scale         = scales;
+        g_expert_shadows[g_n_expert_shadows].expert_bytes  = one_expert_elements;
+        g_n_expert_shadows++;
+    }
+    return 1;
+}
+
 
 int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_gpu_tensor       *out_hc,

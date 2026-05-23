@@ -42,6 +42,7 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_cache_q8_i8_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+int ds4_gpu_cache_expert_i8_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim);
 int ds4_gpu_ane_batch_begin(void);
 int ds4_gpu_ane_batch_flush(void);
 int ds4_gpu_ane_batch_end(void);

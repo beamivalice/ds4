@@ -1481,6 +1481,18 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
             }
             n_dequant++;
         }
+        if (t->ndim == 3 && (t->type == DS4_TENSOR_Q2_K ||
+                              t->type == DS4_TENSOR_IQ2_XXS ||
+                              t->type == DS4_TENSOR_Q4_K)) {
+            if (ds4_gpu_cache_expert_i8_range(m->map, m->size,
+                                               t->abs_offset, t->bytes,
+                                               t->dim[0], t->dim[1]) == 0) {
+                fprintf(stderr, "ds4: Metal failed to convert expert tensor %.*s to INT8\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            n_dequant++;
+        }
     }
     if (n_dequant > 0) {
         const double t1 = now_sec();

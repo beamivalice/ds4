@@ -124,10 +124,6 @@ static id<MTL4ComputeCommandEncoder> g_ane_enc4;
 static id<MTL4ArgumentTable>         g_ane_arg_table;
 static bool g_ane_batch_active;
 
-// Deferred INT8 scale post-multiply queue.
-static struct { id<MTLBuffer> buf; uint64_t off; uint64_t nelm; float s; } g_ane_scales[256];
-static int g_ane_n_scales;
-
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
 static NSMutableArray<id<MTLBuffer>> *g_transient_buffers;
@@ -707,7 +703,6 @@ int ds4_gpu_ane_batch_begin(void) {
             if (!g_ane_arg_table) return 0;
         }
         g_ane_batch_active = true;
-        g_ane_n_scales = 0;
         return 1;
     } @catch (NSException *e) {
         fprintf(stderr, "ds4: ANE batch begin failed: %s\n",
@@ -784,15 +779,6 @@ static int ds4_gpu_ane_batch_dispatch(
                         ((NSUInteger)n_tok   + TILE_M - 1u) / TILE_M, 1)
               threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
-        // --- Defer INT8 scale multiply ---
-        if (n_tok >= 1 && out_dim >= 1 && post_scale != 1.0f &&
-            g_ane_n_scales < (int)(sizeof(g_ane_scales) / sizeof(g_ane_scales[0]))) {
-            g_ane_scales[g_ane_n_scales].buf  = outbuf;
-            g_ane_scales[g_ane_n_scales].off  = outoff;
-            g_ane_scales[g_ane_n_scales].nelm = n_tok * out_dim;
-            g_ane_scales[g_ane_n_scales].s    = post_scale;
-            g_ane_n_scales++;
-        }
         return 1;
     }
 }
@@ -808,18 +794,11 @@ int ds4_gpu_ane_batch_end(void) {
     if ([g_queue conformsToProtocol:@protocol(MTL4CommandQueue)])
         [(id<MTL4CommandQueue>)g_queue commit:&g_ane_cb4 count:1];
 
-    if ([(id)g_ane_cb4 respondsToSelector:@selector(waitUntilCompleted)])
-        [(id<MTLCommandBuffer>)g_ane_cb4 waitUntilCompleted];
-
+    // No wait — MTL4 and MTL3 CBs share the same g_queue.
+    // GPU processes them in submission order.  Scale multiplies were
+    // enqueued inline on the MTL4 encoder, so output is ready by the
+    // time the MTL3 CB reads it.
     g_ane_cb4 = nil;
-
-    for (int i = 0; i < g_ane_n_scales; i++) {
-        float s = g_ane_scales[i].s;
-        float *p = (float *)((uint8_t *)[g_ane_scales[i].buf contents] + g_ane_scales[i].off);
-        uint64_t n = g_ane_scales[i].nelm;
-        for (uint64_t j = 0; j < n; j++) p[j] *= s;
-    }
-    g_ane_n_scales = 0;
     return 1;
 }
 
@@ -2068,6 +2047,7 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    float    post_scale;
 } ds4_gpu_mul_mm_args;
 
 typedef struct {
@@ -2231,6 +2211,7 @@ static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args(
         .ne1 = (int32_t)n_tok,
         .r2 = 1,
         .r3 = 1,
+        .post_scale = 1.0f,
     };
 }
 
@@ -5380,10 +5361,11 @@ int ds4_gpu_matmul_q8_0_tensor(
                     a.nb12 = in_dim * n_tok * sizeof(float);
                     a.nb13 = in_dim * n_tok * sizeof(float);
                     a.ne0 = (int32_t)out_dim; a.ne1 = (int32_t)n_tok;
+                    a.post_scale = 1.0f;
                     float s = g_q8_i8_shadows[i].scale;
 
                     if (g_ane_batch_active) {
-                        // Batched: scale deferred to batch_end().
+                        a.post_scale = s;
                         return ds4_gpu_ane_batch_dispatch(
                             tpl, &a, sizeof(a),
                             g_q8_i8_shadows[i].i8_buf, 0,

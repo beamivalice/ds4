@@ -9269,7 +9269,6 @@ static bool metal_graph_encode_decode_layer(
     }
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
 
-    (void)ds4_gpu_ane_batch_begin();
     bool ok = true;
     const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;

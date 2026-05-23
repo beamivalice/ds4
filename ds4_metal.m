@@ -34,6 +34,8 @@ enum {
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
+static id<MTLLibrary> g_tensor_library;
+static bool g_has_tensor_accel;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
@@ -102,6 +104,30 @@ static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
+
+// Q8_0 → plain INT8 weight shadow table (for ANE INT8 matmul).
+// Populated by ds4_gpu_cache_q8_i8_range() at model load time.
+// Each entry maps the original Q8_0 model offset to an INT8 buffer
+// and its uniform requantization scale factor.
+static struct {
+    uint64_t      q8_offset;
+    id<MTLBuffer> i8_buf;
+    float         scale;
+} g_q8_i8_shadows[4096];
+static int g_n_q8_i8_shadows;
+
+// ANE batch encoder globals — reused across matmuls within one layer.
+// Created by ds4_gpu_ane_batch_begin(), dispatched by _add(), committed by _end().
+static id<MTL4CommandAllocator>      g_ane_alloc;
+static id<MTL4CommandBuffer>         g_ane_cb4;
+static id<MTL4ComputeCommandEncoder> g_ane_enc4;
+static id<MTL4ArgumentTable>         g_ane_arg_table;
+static bool g_ane_batch_active;
+
+// Deferred INT8 scale post-multiply queue.
+static struct { id<MTLBuffer> buf; uint64_t off; uint64_t nelm; float s; } g_ane_scales[256];
+static int g_ane_n_scales;
+
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
 static NSMutableArray<id<MTLBuffer>> *g_transient_buffers;
@@ -620,6 +646,321 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
 
     [g_pipeline_cache setObject:pipeline forKey:key];
     return pipeline;
+}
+
+static bool ds4_gpu_tensor_mm_eligible(uint64_t n_tok, uint64_t in_dim, uint64_t out_dim) {
+    if (!g_has_tensor_accel) return false;
+    if (n_tok < 32 || in_dim < 32 || out_dim < 32) return false;
+    return true;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_get_tensor_mm_pipeline(void) {
+    if (!g_has_tensor_accel) return nil;
+    NSString *key = @"kernel_tensor_mm_f16_f32";
+    id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
+    if (cached) return cached;
+    id<MTLFunction> fn = [g_tensor_library newFunctionWithName:key];
+    if (!fn) return nil;
+    NSError *err = nil;
+    id<MTLComputePipelineState> pl = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pl) return nil;
+    [g_pipeline_cache setObject:pl forKey:key];
+    return pl;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_get_tensor_mm_i8_pipeline(void) {
+    if (!g_has_tensor_accel) return nil;
+    NSString *key = @"kernel_tensor_mm_i8_f32";
+    id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
+    if (cached) return cached;
+    id<MTLFunction> fn = [g_tensor_library newFunctionWithName:key];
+    if (!fn) return nil;
+    NSError *err = nil;
+    id<MTLComputePipelineState> pl = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pl) return nil;
+    [g_pipeline_cache setObject:pl forKey:key];
+    return pl;
+}
+
+// --- Batched ANE matmul dispatch ----------------------------------------
+// Instead of one MTL4CommandBuffer + allocator per matmul (8600 × 15 µs
+// overhead at 2048-token prefill), reuse one encoder per layer.  The graph
+// encoder calls begin/add/end around each layer's matmul group.
+
+int ds4_gpu_ane_batch_begin(void) {
+    if (!g_has_tensor_accel) return 0;
+    if (@available(macOS 26.0, *)) {} else return 0;
+    @try {
+        if (!g_ane_alloc)
+            g_ane_alloc = [g_device newCommandAllocator];
+        if (!g_ane_alloc) return 0;
+        g_ane_cb4 = [g_device newCommandBuffer];
+        if (!g_ane_cb4) return 0;
+        [g_ane_cb4 beginCommandBufferWithAllocator:g_ane_alloc];
+        g_ane_enc4 = [g_ane_cb4 computeCommandEncoder];
+        if (!g_ane_enc4) return 0;
+        if (!g_ane_arg_table) {
+            MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new];
+            atd.maxBufferBindCount = 4;
+            NSError *err = nil;
+            g_ane_arg_table = [g_device newArgumentTableWithDescriptor:atd error:&err];
+            if (!g_ane_arg_table) return 0;
+        }
+        g_ane_batch_active = true;
+        g_ane_n_scales = 0;
+        return 1;
+    } @catch (NSException *e) {
+        fprintf(stderr, "ds4: ANE batch begin failed: %s\n",
+                [[e description] UTF8String]);
+        return 0;
+    }
+}
+
+static int ds4_gpu_ane_batch_dispatch(
+        id<MTLComputePipelineState>  pipeline,
+        const void                  *args,
+        size_t                       args_len,
+        id<MTLBuffer>                wbuf,  NSUInteger woff,
+        id<MTLBuffer>                xbuf,  NSUInteger xoff,
+        id<MTLBuffer>                outbuf, NSUInteger outoff,
+        uint64_t in_dim, uint64_t out_dim, uint64_t n_tok,
+        float post_scale)              // 1.0f for FP16, single_scale for INT8
+{
+    @autoreleasepool {
+        // --- Build tensors ---
+        id<MTLTensor> wt = nil, xt = nil, ct = nil;
+
+        bool is_i8 = (post_scale != 1.0f || pipeline == ds4_gpu_get_tensor_mm_i8_pipeline());
+        MTLTensorDataType wtype = is_i8 ? MTLTensorDataTypeInt8 : MTLTensorDataTypeFloat16;
+
+        {
+            NSInteger w_dims[2] = {(NSInteger)in_dim, (NSInteger)out_dim};
+            NSInteger w_strides[2] = {1, (NSInteger)in_dim};
+            MTLTensorDescriptor *wd = [MTLTensorDescriptor new];
+            wd.dataType = wtype; wd.usage = MTLTensorUsageCompute;
+            wd.dimensions = [[MTLTensorExtents alloc] initWithRank:2 values:w_dims];
+            wd.strides    = [[MTLTensorExtents alloc] initWithRank:2 values:w_strides];
+            wt = [wbuf newTensorWithDescriptor:wd offset:woff error:nil];
+            if (!wt) return 0;
+        }
+        {
+            NSInteger x_dims[2] = {(NSInteger)in_dim, (NSInteger)n_tok};
+            NSInteger x_strides[2] = {1, (NSInteger)in_dim};
+            MTLTensorDescriptor *xd = [MTLTensorDescriptor new];
+            xd.dataType = MTLTensorDataTypeFloat32; xd.usage = MTLTensorUsageCompute;
+            xd.dimensions = [[MTLTensorExtents alloc] initWithRank:2 values:x_dims];
+            xd.strides    = [[MTLTensorExtents alloc] initWithRank:2 values:x_strides];
+            xt = [xbuf newTensorWithDescriptor:xd offset:xoff error:nil];
+            if (!xt) return 0;
+        }
+        {
+            NSInteger c_dims[2] = {(NSInteger)out_dim, (NSInteger)n_tok};
+            NSInteger c_strides[2] = {1, (NSInteger)out_dim};
+            MTLTensorDescriptor *cd = [MTLTensorDescriptor new];
+            cd.dataType = MTLTensorDataTypeFloat32; cd.usage = MTLTensorUsageCompute;
+            cd.dimensions = [[MTLTensorExtents alloc] initWithRank:2 values:c_dims];
+            cd.strides    = [[MTLTensorExtents alloc] initWithRank:2 values:c_strides];
+            ct = [outbuf newTensorWithDescriptor:cd offset:outoff error:nil];
+            if (!ct) return 0;
+        }
+
+        // --- Create args buffer ---
+        id<MTLBuffer> abuf = [g_device newBufferWithLength:args_len
+                                                   options:MTLResourceStorageModeShared];
+        if (!abuf) return 0;
+        memcpy([abuf contents], args, args_len);
+
+        // --- Bind argument table ---
+        [g_ane_arg_table setAddress:[abuf gpuAddress] atIndex:0];
+        [g_ane_arg_table setResource:[wt gpuResourceID] atBufferIndex:1];
+        [g_ane_arg_table setResource:[xt gpuResourceID] atBufferIndex:2];
+        [g_ane_arg_table setResource:[ct gpuResourceID] atBufferIndex:3];
+
+        [g_ane_enc4 setComputePipelineState:pipeline];
+        [g_ane_enc4 setArgumentTable:g_ane_arg_table];
+        static const int TILE_M = 64, TILE_N = 32;
+        [g_ane_enc4 dispatchThreadgroups:
+            MTLSizeMake(((NSUInteger)out_dim + TILE_N - 1u) / TILE_N,
+                        ((NSUInteger)n_tok   + TILE_M - 1u) / TILE_M, 1)
+              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+
+        // --- Defer INT8 scale multiply ---
+        if (n_tok >= 1 && out_dim >= 1 && post_scale != 1.0f &&
+            g_ane_n_scales < (int)(sizeof(g_ane_scales) / sizeof(g_ane_scales[0]))) {
+            g_ane_scales[g_ane_n_scales].buf  = outbuf;
+            g_ane_scales[g_ane_n_scales].off  = outoff;
+            g_ane_scales[g_ane_n_scales].nelm = n_tok * out_dim;
+            g_ane_scales[g_ane_n_scales].s    = post_scale;
+            g_ane_n_scales++;
+        }
+        return 1;
+    }
+}
+
+int ds4_gpu_ane_batch_end(void) {
+    if (!g_ane_batch_active) return 0;
+    g_ane_batch_active = false;
+
+    [g_ane_enc4 endEncoding];
+    g_ane_enc4 = nil;
+    [g_ane_cb4 endCommandBuffer];
+
+    if ([g_queue conformsToProtocol:@protocol(MTL4CommandQueue)])
+        [(id<MTL4CommandQueue>)g_queue commit:&g_ane_cb4 count:1];
+
+    if ([(id)g_ane_cb4 respondsToSelector:@selector(waitUntilCompleted)])
+        [(id<MTLCommandBuffer>)g_ane_cb4 waitUntilCompleted];
+
+    g_ane_cb4 = nil;
+
+    for (int i = 0; i < g_ane_n_scales; i++) {
+        float s = g_ane_scales[i].s;
+        float *p = (float *)((uint8_t *)[g_ane_scales[i].buf contents] + g_ane_scales[i].off);
+        uint64_t n = g_ane_scales[i].nelm;
+        for (uint64_t j = 0; j < n; j++) p[j] *= s;
+    }
+    g_ane_n_scales = 0;
+    return 1;
+}
+
+int ds4_gpu_ane_batch_flush(void) {
+    if (!g_ane_batch_active) return 0;
+    int rc = ds4_gpu_ane_batch_end();
+    if (rc) rc = ds4_gpu_ane_batch_begin();
+    return rc;
+}
+
+static int ds4_gpu_tensor_mm_dispatch(
+        id<MTLCommandBuffer>         cb,
+        id<MTLComputePipelineState>  pipeline,
+        const void                  *args,
+        size_t                       args_len,
+        id<MTLBuffer>                wbuf,
+        NSUInteger                   woffset,
+        uint64_t                     in_dim,
+        uint64_t                     out_dim,
+        id<MTLBuffer>                xbuf,
+        NSUInteger                   xoffset,
+        id<MTLBuffer>                outbuf,
+        NSUInteger                   outoffset,
+        uint64_t                     n_tok) {
+    // Delegate to batched encoder when a layer-level session is active.
+    if (g_ane_batch_active) {
+        return ds4_gpu_ane_batch_dispatch(pipeline, args, args_len,
+                                          wbuf, woffset, xbuf, xoffset,
+                                          outbuf, outoffset,
+                                          in_dim, out_dim, n_tok, 1.0f);
+    }
+
+    @autoreleasepool {
+        // --- Create MTLTensors with proper descriptors ---
+        NSInteger w_dims[2] = {(NSInteger)in_dim, (NSInteger)out_dim};
+        NSInteger w_strides[2] = {1, (NSInteger)in_dim};
+        MTLTensorDescriptor *w_desc = [MTLTensorDescriptor new];
+        w_desc.dataType   = MTLTensorDataTypeFloat16;
+        w_desc.dimensions = [[MTLTensorExtents alloc] initWithRank:2 values:w_dims];
+        w_desc.strides    = [[MTLTensorExtents alloc] initWithRank:2 values:w_strides];
+        w_desc.usage      = MTLTensorUsageCompute;
+        NSError *werr = nil;
+        id<MTLTensor> wt = [wbuf newTensorWithDescriptor:w_desc offset:woffset error:&werr];
+        if (!wt) { fprintf(stderr, "ds4: ANE w tensor failed: %s\n", [[werr localizedDescription] UTF8String]); return 0; }
+
+        NSInteger x_dims[2] = {(NSInteger)in_dim, (NSInteger)n_tok};
+        NSInteger x_strides[2] = {1, (NSInteger)in_dim};
+        MTLTensorDescriptor *x_desc = [MTLTensorDescriptor new];
+        x_desc.dataType   = MTLTensorDataTypeFloat32;
+        x_desc.dimensions = [[MTLTensorExtents alloc] initWithRank:2 values:x_dims];
+        x_desc.strides    = [[MTLTensorExtents alloc] initWithRank:2 values:x_strides];
+        x_desc.usage      = MTLTensorUsageCompute;
+        NSError *xerr = nil;
+        id<MTLTensor> xt = [xbuf newTensorWithDescriptor:x_desc offset:xoffset error:&xerr];
+        if (!xt) { fprintf(stderr, "ds4: ANE x tensor failed: %s\n", [[xerr localizedDescription] UTF8String]); return 0; }
+
+        NSInteger c_dims[2] = {(NSInteger)out_dim, (NSInteger)n_tok};
+        NSInteger c_strides[2] = {1, (NSInteger)out_dim};
+        MTLTensorDescriptor *c_desc = [MTLTensorDescriptor new];
+        c_desc.dataType   = MTLTensorDataTypeFloat32;
+        c_desc.dimensions = [[MTLTensorExtents alloc] initWithRank:2 values:c_dims];
+        c_desc.strides    = [[MTLTensorExtents alloc] initWithRank:2 values:c_strides];
+        c_desc.usage      = MTLTensorUsageCompute;
+        NSError *cerr = nil;
+        id<MTLTensor> ct = [outbuf newTensorWithDescriptor:c_desc offset:outoffset error:&cerr];
+        if (!ct) { fprintf(stderr, "ds4: ANE c tensor failed: %s\n", [[cerr localizedDescription] UTF8String]); return 0; }
+
+        // --- Metal 4 pathway or Metal 3 fallback ---
+        if (@available(macOS 26.0, *)) {
+            @try {
+                id<MTL4CommandBuffer> cb4 = [g_device newCommandBuffer];
+                if (!cb4) return 0;
+                id<MTL4CommandAllocator> alloc = [g_device newCommandAllocator];
+                if (!alloc) return 0;
+                [cb4 beginCommandBufferWithAllocator:alloc];
+
+                id<MTLBuffer> args_buf = [g_device newBufferWithLength:args_len
+                                                               options:MTLResourceStorageModeShared];
+                if (!args_buf) return 0;
+                memcpy([args_buf contents], args, args_len);
+
+                MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new];
+                atd.maxBufferBindCount = 4;
+                NSError *aerr = nil;
+                id<MTL4ArgumentTable> argTable =
+                    [g_device newArgumentTableWithDescriptor:atd error:&aerr];
+                if (!argTable) return 0;
+
+                [argTable setAddress:[args_buf gpuAddress] atIndex:0];
+                [argTable setResource:[wt gpuResourceID] atBufferIndex:1];
+                [argTable setResource:[xt gpuResourceID] atBufferIndex:2];
+                [argTable setResource:[ct gpuResourceID] atBufferIndex:3];
+
+                id<MTL4ComputeCommandEncoder> enc4 = [cb4 computeCommandEncoder];
+                if (!enc4) return 0;
+                [enc4 setComputePipelineState:pipeline];
+                [enc4 setArgumentTable:argTable];
+                static const int TILE_M = 64, TILE_N = 32;
+                [enc4 dispatchThreadgroups:
+                    MTLSizeMake(((NSUInteger)out_dim + TILE_N - 1u) / TILE_N,
+                                ((NSUInteger)n_tok   + TILE_M - 1u) / TILE_M, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                [enc4 endEncoding];
+                [cb4 endCommandBuffer];
+
+                if (![g_queue conformsToProtocol:@protocol(MTL4CommandQueue)])
+                    return 0;
+                [(id<MTL4CommandQueue>)g_queue commit:&cb4 count:1];
+
+                // Synchronize: if cb4 responds to MTLCommandBuffer
+                // wait/status, use them; otherwise skip the check.
+                if ([(id)cb4 respondsToSelector:@selector(waitUntilCompleted)]) {
+                    id<MTLCommandBuffer> cb3 = (id<MTLCommandBuffer>)cb4;
+                    [cb3 waitUntilCompleted];
+                    if (cb3.status == MTLCommandBufferStatusError) return 0;
+                }
+                return 1;
+            } @catch (NSException *e) {
+                fprintf(stderr, "ds4: ANE fallback to SIMD: %s\n",
+                        [[e description] UTF8String]);
+                // fall through to SIMD below
+            }
+        }
+
+        // Metal 3 SIMD matmul (always works)
+        {
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:args length:args_len atIndex:0];
+            [enc setBuffer:[wt buffer] offset:[wt bufferOffset] atIndex:1];
+            [enc setBuffer:[xt buffer] offset:[xt bufferOffset] atIndex:2];
+            [enc setBuffer:[ct buffer] offset:[ct bufferOffset] atIndex:3];
+            static const int TILE_M = 64, TILE_N = 32;
+            [enc dispatchThreadgroups:
+                MTLSizeMake(((NSUInteger)out_dim + TILE_N - 1u) / TILE_N,
+                            ((NSUInteger)n_tok   + TILE_M - 1u) / TILE_M, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+        return 1;
+    }
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
@@ -1263,6 +1604,21 @@ static NSString *ds4_gpu_full_source(void) {
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
     return source;
+}
+
+static NSString *ds4_gpu_tensor_source(void) {
+    NSArray<NSString *> *paths = @[
+        @"metal/tensor_matmul.metal",
+        @"./metal/tensor_matmul.metal",
+    ];
+    for (NSString *path in paths) {
+        NSError *error = nil;
+        NSString *src = [NSString stringWithContentsOfFile:path
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:&error];
+        if (src) return src;
+    }
+    return nil;
 }
 
 typedef struct {
@@ -2714,6 +3070,41 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_library = library;
+
+        {
+            NSString *tsrc = ds4_gpu_tensor_source();
+            if (tsrc) {
+                MTLCompileOptions *topt = [MTLCompileOptions new];
+                if (@available(macOS 26.0, *)) {
+                    topt.languageVersion = MTLLanguageVersion4_0;
+                }
+                NSError *terr = nil;
+                id<MTLLibrary> tlib = [g_device newLibraryWithSource:tsrc
+                                                             options:topt
+                                                               error:&terr];
+                if (tlib) {
+                    g_tensor_library = tlib;
+                    id<MTLFunction> tfn =
+                        [tlib newFunctionWithName:@"kernel_tensor_mm_f16_f32"];
+                    if (tfn) {
+                        id<MTLComputePipelineState> tpl =
+                            [g_device newComputePipelineStateWithFunction:tfn
+                                                                    error:&terr];
+                        if (tpl) {
+                            g_has_tensor_accel = true;
+                            fprintf(stderr,
+                                    "ds4: M5 Neural Accelerator tensor matmul enabled\n");
+                        }
+                    }
+                }
+                if (!g_has_tensor_accel) {
+                    fprintf(stderr,
+                            "ds4: Neural Accelerator unavailable%s%s, using SIMD matmul\n",
+                            terr ? " (" : "",
+                            terr ? [[terr localizedDescription] UTF8String] : "");
+                }
+            }
+        }
 
         id<MTLFunction> fn = [library newFunctionWithName:@"kernel_get_rows_f32"];
         if (!fn) {
@@ -4960,6 +5351,65 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    // --- INT8 shadow redirect ---
+    // If this tensor was pre-converted to plain INT8 with a uniform scale,
+    // and the batch is large enough (n_tok >= 32) for ANE, use the INT8 path.
+    for (int i = 0; i < g_n_q8_i8_shadows; i++) {
+        if (g_q8_i8_shadows[i].q8_offset == weight_offset) {
+            if (n_tok >= 32 && in_dim >= 32 && out_dim >= 32) {
+                id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+                id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+                if (!xbuf || !outbuf ||
+                    ds4_gpu_tensor_bytes(x) < n_tok * in_dim * sizeof(float) ||
+                    ds4_gpu_tensor_bytes(out) < n_tok * out_dim * sizeof(float))
+                    break;
+                id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                if (!cb) break;
+
+                // Dispatch ANE INT8 matmul.
+                id<MTLComputePipelineState> tpl = ds4_gpu_get_tensor_mm_i8_pipeline();
+                if (tpl) {
+                    ds4_gpu_mul_mm_args a;
+                    uint64_t row_bytes = in_dim * sizeof(int8_t);
+                    memset(&a, 0, sizeof(a));
+                    a.ne00 = (int32_t)in_dim; a.ne02 = 1;
+                    a.nb01 = row_bytes; a.nb02 = row_bytes * out_dim;
+                    a.nb03 = row_bytes * out_dim; a.ne12 = 1;
+                    a.nb10 = sizeof(float); a.nb11 = in_dim * sizeof(float);
+                    a.nb12 = in_dim * n_tok * sizeof(float);
+                    a.nb13 = in_dim * n_tok * sizeof(float);
+                    a.ne0 = (int32_t)out_dim; a.ne1 = (int32_t)n_tok;
+                    float s = g_q8_i8_shadows[i].scale;
+
+                    if (g_ane_batch_active) {
+                        // Batched: scale deferred to batch_end().
+                        return ds4_gpu_ane_batch_dispatch(
+                            tpl, &a, sizeof(a),
+                            g_q8_i8_shadows[i].i8_buf, 0,
+                            xbuf, (NSUInteger)ds4_gpu_tensor_offset(x),
+                            outbuf, (NSUInteger)ds4_gpu_tensor_offset(out),
+                            in_dim, out_dim, n_tok, s);
+                    }
+                    if (ds4_gpu_tensor_mm_dispatch(
+                            cb, tpl, &a, sizeof(a),
+                            g_q8_i8_shadows[i].i8_buf, 0,
+                            in_dim, out_dim,
+                            xbuf, (NSUInteger)ds4_gpu_tensor_offset(x),
+                            outbuf, (NSUInteger)ds4_gpu_tensor_offset(out),
+                            n_tok)) {
+                        float *p = (float *)((uint8_t *)[outbuf contents] +
+                                             ds4_gpu_tensor_offset(out));
+                        for (uint64_t j = 0; j < n_tok * out_dim; j++)
+                            p[j] *= s;
+                        return 1;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     if ((in_dim & 31u) != 0 ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
@@ -5274,6 +5724,26 @@ int ds4_gpu_matmul_f16_tensor(
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor mul_mv_ext")) return 0;
             return 1;
+        }
+
+        // Neural Accelerator path (M5/A19+).  The dispatch function creates
+        // its own MTL4 command buffer + argument table when available, and
+        // handles its own commit.  Falls back to SIMD on failure.
+        if (ds4_gpu_tensor_mm_eligible(n_tok, in_dim, out_dim)) {
+            id<MTLComputePipelineState> tpl = ds4_gpu_get_tensor_mm_pipeline();
+            if (tpl) {
+                ds4_gpu_mul_mm_args args =
+                    ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+                if (ds4_gpu_tensor_mm_dispatch(
+                        cb, tpl, &args, sizeof(args),
+                        wbuf, (NSUInteger)inner_offset,
+                        in_dim, out_dim,
+                        xbuf, (NSUInteger)ds4_gpu_tensor_offset(x),
+                        outbuf, (NSUInteger)ds4_gpu_tensor_offset(out),
+                        n_tok)) {
+                    return 1;
+                }
+            }
         }
 
         const bool bc_inp = (in_dim % 32u) != 0;
@@ -14602,6 +15072,94 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "shared-down HC expand fused")) return 0;
     }
 
+    return 1;
+}
+
+// ds4_gpu_cache_q8_i8_range — convert a Q8_0 tensor to plain INT8 + scale
+// and register it in the shadow table for ANE INT8 matmul dispatch.
+//
+// Q8_0 block (34 bytes): half d + int8_t qs[32].
+// We dequantize to FP32, find the max absolute value, compute a single
+// uniform scale, requantize to int8_t, and store the int8 buffer + scale.
+int ds4_gpu_cache_q8_i8_range(
+        const void *model_map,
+        uint64_t    model_size,
+        uint64_t    offset,
+        uint64_t    bytes,
+        uint64_t    in_dim,
+        uint64_t    out_dim,
+        const char *label) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || !bytes) return 1;
+    if ((in_dim & 31u) != 0 || in_dim == 0 || out_dim == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+
+    (void)label;
+
+    // Box the model bytes through a model view so we operate inside the
+    // mapped region.  The buffer may be GPU-resident but is
+    // MTLStorageModeShared, so CPU reads are legal (uncached but correct).
+    uint64_t inner_offset = 0;
+    id<MTLBuffer> src_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                      offset, bytes, &inner_offset);
+    if (!src_buf) return 0;
+
+    const uint64_t elements = in_dim * out_dim;
+    const uint64_t blocks   = in_dim / 32u;
+
+    // Allocate plain INT8 buffer (1 byte per element).
+    id<MTLBuffer> i8_buf = [g_device newBufferWithLength:(NSUInteger)elements
+                                                  options:MTLResourceStorageModeShared];
+    if (!i8_buf) return 0;
+    int8_t *dst = (int8_t *)[i8_buf contents];
+    if (!dst) return 0;
+
+    // --- Pass 1: read Q8_0 blocks, find max |value| ---
+    const uint8_t *src_bytes = (const uint8_t *)model_map + offset;
+    float max_abs = 1e-8f;
+
+    // We do this CPU-side because the conversion is one-shot and
+    // the model map is MTLStorageModeShared (readable from CPU).
+    for (uint64_t row = 0; row < out_dim; row++) {
+        const uint64_t row_off = row * blocks * 34u;
+        for (uint64_t blk = 0; blk < blocks; blk++) {
+            const uint8_t *b = src_bytes + row_off + blk * 34u;
+            float d;
+            memcpy(&d, b, sizeof(uint16_t));  // half
+            for (uint32_t j = 0; j < 32u; j++) {
+                float v = (float)(int8_t)b[2u + j] * d;
+                float abs_v = v < 0 ? -v : v;
+                if (abs_v > max_abs) max_abs = abs_v;
+            }
+        }
+    }
+
+    // --- Pass 2: requantize to plain INT8 ---
+    float single_scale = max_abs / 127.0f;
+    float inv_scale = 1.0f / single_scale;
+
+    for (uint64_t row = 0; row < out_dim; row++) {
+        const uint64_t row_off = row * blocks * 34u;
+        for (uint64_t blk = 0; blk < blocks; blk++) {
+            const uint8_t *b = src_bytes + row_off + blk * 34u;
+            float d;
+            memcpy(&d, b, sizeof(uint16_t));
+            for (uint32_t j = 0; j < 32u; j++) {
+                float v = (float)(int8_t)b[2u + j] * d;
+                int val = (int)(v * inv_scale + (v >= 0 ? 0.5f : -0.5f));
+                if (val > 127) val = 127;
+                if (val < -128) val = -128;
+                dst[row * in_dim + blk * 32u + j] = (int8_t)val;
+            }
+        }
+    }
+
+    if (g_n_q8_i8_shadows < (int)(sizeof(g_q8_i8_shadows) / sizeof(g_q8_i8_shadows[0]))) {
+        g_q8_i8_shadows[g_n_q8_i8_shadows].q8_offset = offset;
+        g_q8_i8_shadows[g_n_q8_i8_shadows].i8_buf    = i8_buf;
+        g_q8_i8_shadows[g_n_q8_i8_shadows].scale      = single_scale;
+        g_n_q8_i8_shadows++;
+    }
     return 1;
 }
 

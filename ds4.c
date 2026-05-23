@@ -1461,8 +1461,33 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 }
 #else
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
-    (void)backend;
-    (void)m;
+    if (backend != DS4_BACKEND_METAL) return true;
+    if (!m || !m->map || m->size == 0) return false;
+    if (getenv("DS4_METAL_Q8_I8_PRELOAD") == NULL) return true;
+
+    const double t0 = now_sec();
+    uint64_t n_dequant = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+        if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2) {
+            char label[128];
+            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+            if (ds4_gpu_cache_q8_i8_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+                fprintf(stderr, "ds4: Metal failed to convert Q8 tensor to INT8 %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            n_dequant++;
+        }
+    }
+    if (n_dequant > 0) {
+        const double t1 = now_sec();
+        fprintf(stderr,
+                "ds4: converted %" PRIu64 " Q8_0 tensors to INT8 in %.3fs\n",
+                n_dequant, t1 - t0);
+    }
     return true;
 }
 #endif
@@ -9244,6 +9269,7 @@ static bool metal_graph_encode_decode_layer(
     }
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
 
+    (void)ds4_gpu_ane_batch_begin();
     bool ok = true;
     const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
@@ -9971,6 +9997,7 @@ static bool metal_graph_encode_decode_layer(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
 #undef DS4_METAL_PROFILE_DECODE_STAGE
+    (void)ds4_gpu_ane_batch_end();
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
@@ -11157,6 +11184,7 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    (void)ds4_gpu_ane_batch_begin();
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -12490,6 +12518,7 @@ static bool metal_graph_encode_layer_attention_batch(
     free(comp_counts);
 #undef DS4_METAL_PROFILE_ATTN_STAGE
 #undef DS4_METAL_PROFILE_Q_STAGE
+    (void)ds4_gpu_ane_batch_end();
     return ok;
 }
 
@@ -12503,6 +12532,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    (void)ds4_gpu_ane_batch_begin();
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -12751,6 +12781,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
 #undef DS4_METAL_PROFILE_FFN_STAGE
+    (void)ds4_gpu_ane_batch_end();
     return ok;
 }
 

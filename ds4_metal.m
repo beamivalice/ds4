@@ -35,6 +35,8 @@ enum {
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
+static id<MTLLibrary> g_tensor_library;
+static bool g_has_tensor_accel;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
@@ -101,6 +103,26 @@ static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_finalize_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_router_weights_one_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand4_pipeline;
+static id<MTLComputePipelineState> g_q2k_to_i4_step1_pipeline;
+static id<MTLComputePipelineState> g_q2k_to_i4_step2_pipeline;
+static id<MTLComputePipelineState> g_q8_to_i8_step1_pipeline;
+static id<MTLComputePipelineState> g_q8_to_i8_step2_pipeline;
+
+static struct { uint64_t q8_offset; id<MTLBuffer> i8_buf; float scale; } g_q8_i8_shadows[4096];
+static int g_n_q8_i8_shadows;
+
+static struct { uint64_t base_offset; id<MTLBuffer> i4_buf; float *scale; uint64_t expert_bytes; } g_expert_i4_shadows[6];
+static int g_n_expert_i4_shadows;
+static id<MTL4CommandAllocator> g_ane_al;
+static id<MTL4CommandBuffer> g_ane_cb;
+static id<MTL4ComputeCommandEncoder> g_ane_en;
+static id<MTL4ArgumentTable> g_ane_at;
+static bool g_ane_active;
+
+static id<MTLComputePipelineState> ds4_gpu_get_tensor_mm_i4_pipeline(void);
+static id<MTLComputePipelineState> ds4_gpu_get_tensor_mm_i8_pipeline(void);
+static int ds4_gpu_i4_moe_dispatch(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pl, const void *args, size_t args_len, float *ps, bool is_int8, id<MTLBuffer> wbuf, NSUInteger woff, uint64_t in_dim, uint64_t out_dim, id<MTLBuffer> xbuf, NSUInteger xoff, id<MTLBuffer> outbuf, NSUInteger outoff, uint64_t n_tok);
+
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *g_pipeline_cache;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_model_buffer_cache;
 static NSMutableArray<id<MTLBuffer>> *g_transient_buffers;
@@ -1475,6 +1497,8 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_Q2K_I4_SOURCE",   @"metal/q2k_to_i4.metal"],
+        @[@"DS4_METAL_DEQUANT_SOURCE",  @"metal/dequant.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -1514,6 +1538,16 @@ static NSString *ds4_gpu_full_source(void) {
         [source appendFormat:@"\n// appended %@\n%@\n", loaded_path, loaded];
     }
     return source;
+}
+
+static NSString *ds4_gpu_tensor_source(void) {
+    NSArray<NSString *> *paths = @[@"metal/tensor_matmul.metal", @"./metal/tensor_matmul.metal"];
+    for (NSString *path in paths) {
+        NSError *error = nil;
+        NSString *src = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:&error];
+        if (src) return src;
+    }
+    return nil;
 }
 
 typedef struct {
@@ -1963,6 +1997,7 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    float    post_scale;
 } ds4_gpu_mul_mm_args;
 
 typedef struct {
@@ -2126,6 +2161,7 @@ static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args(
         .ne1 = (int32_t)n_tok,
         .r2 = 1,
         .r3 = 1,
+        .post_scale = 1.0f,
     };
 }
 
@@ -3042,6 +3078,17 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_library = library;
+
+        {
+            NSString *tsrc = ds4_gpu_tensor_source();
+            if (tsrc) {
+                MTLCompileOptions *topt = [MTLCompileOptions new];
+                if (@available(macOS 26.0, *)) topt.languageVersion = MTLLanguageVersion4_0;
+                NSError *terr = nil;
+                id<MTLLibrary> tlib = [g_device newLibraryWithSource:tsrc options:topt error:&terr];
+                if (tlib) { g_tensor_library = tlib; g_has_tensor_accel = true; }
+            }
+        }
 
         id<MTLFunction> fn = [library newFunctionWithName:@"kernel_get_rows_f32"];
         if (!fn) {
@@ -4112,6 +4159,14 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_router_weights_one");
         g_dsv4_hc_expand4_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4");
+        g_q2k_to_i4_step1_pipeline =
+            ds4_gpu_get_pipeline("kernel_q2k_to_i4_step1");
+        g_q2k_to_i4_step2_pipeline =
+            ds4_gpu_get_pipeline("kernel_q2k_to_i4_step2");
+        g_q8_to_i8_step1_pipeline =
+            ds4_gpu_get_pipeline("kernel_q8_to_i8_step1");
+        g_q8_to_i8_step2_pipeline =
+            ds4_gpu_get_pipeline("kernel_q8_to_i8_step2");
         if (!g_dsv4_indexer_score_one_direct_pipeline ||
             !g_dsv4_compressor_store_one_pipeline ||
             !g_dsv4_sort_i32_rows_asc_pipeline ||
@@ -5511,6 +5566,25 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
          * staging RHS into threadgroup memory and was the direct replacement for
          * the slower generic MPP prototype.
          */
+        // INT8 shadow redirect: use pre-converted INT8 via tensor matmul.
+        for (int si=0; si<g_n_q8_i8_shadows; si++) {
+            if (g_q8_i8_shadows[si].q8_offset==weight_offset && n_tok>=32) {
+                id<MTLComputePipelineState> pl = ds4_gpu_get_tensor_mm_i8_pipeline();
+                if (pl) {
+                    ds4_gpu_mul_mm_args a = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, in_dim);
+                    float s = g_q8_i8_shadows[si].scale;
+                    a.post_scale = s;
+                    if (ds4_gpu_i4_moe_dispatch(cb, pl, &a, sizeof(a), &s, true,
+                        g_q8_i8_shadows[si].i8_buf, 0, in_dim, out_dim,
+                        xbuf, ds4_gpu_tensor_offset(x),
+                        outbuf, ds4_gpu_tensor_offset(out), n_tok)) {
+                        return 1;
+                    }
+                }
+                break;
+            }
+        }
+
         if (ds4_gpu_mpp_available() &&
             n_tok >= 32u &&
             (in_dim % 64u) == 0 &&
@@ -5579,6 +5653,40 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         }
     }
 
+    return 1;
+}
+
+// GPU Q8_0 → INT8 conversion at model load time.
+int ds4_gpu_cache_q8_i8_range(
+        const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes,
+        uint64_t in_dim, uint64_t out_dim, const char *label) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || !bytes) return 1;
+    if ((in_dim & 31u) != 0 || in_dim == 0 || out_dim == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    (void)label;
+    const uint64_t blocks = in_dim / 32u, elements = in_dim * out_dim, n_total = out_dim * blocks;
+    uint64_t inner=0;
+    id<MTLBuffer> sb=ds4_gpu_wrap_model_range(model_map,model_size,offset,bytes,&inner);
+    if(!sb)return 0;
+    id<MTLBuffer> i8b=[g_device newBufferWithLength:(NSUInteger)elements options:MTLResourceStorageModeShared];
+    if(!i8b)return 0;
+    {id<MTLBuffer> am=[g_device newBufferWithLength:(NSUInteger)(n_total*sizeof(float)) options:MTLResourceStorageModeShared];
+    if(!am)return 0;
+    {id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
+    [enc setComputePipelineState:g_q8_to_i8_step1_pipeline]; [enc setBuffer:sb offset:(NSUInteger)inner atIndex:0];
+    [enc setBuffer:am offset:0 atIndex:1]; [enc dispatchThreads:MTLSizeMake((NSUInteger)n_total,1,1)
+    threadsPerThreadgroup:MTLSizeMake(256u,1u,1u)]; [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];}
+    float ma=1e-8f; const float *ap=(const float*)[am contents];
+    for(uint64_t i=0;i<n_total;i++)if(ap[i]>ma)ma=ap[i]; float s=ma/127.0f;
+    {id<MTLCommandBuffer> cb=[g_queue commandBuffer]; id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
+    [enc setComputePipelineState:g_q8_to_i8_step2_pipeline]; [enc setBuffer:sb offset:(NSUInteger)inner atIndex:0];
+    [enc setBuffer:i8b offset:0 atIndex:1]; [enc setBytes:&s length:sizeof(float) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)n_total,1,1) threadsPerThreadgroup:MTLSizeMake(256u,1u,1u)];
+    [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];}
+    if(g_n_q8_i8_shadows<(int)(sizeof(g_q8_i8_shadows)/sizeof(g_q8_i8_shadows[0]))){
+    g_q8_i8_shadows[g_n_q8_i8_shadows].q8_offset=offset; g_q8_i8_shadows[g_n_q8_i8_shadows].i8_buf=i8b;
+    g_q8_i8_shadows[g_n_q8_i8_shadows].scale=s; g_n_q8_i8_shadows++;}}
     return 1;
 }
 
@@ -14249,6 +14357,52 @@ int ds4_gpu_routed_moe_batch_tensor(
          * write/read. --quality keeps the older F32 intermediate.
          */
         const bool request_mid_f16 = !g_quality_mode;
+
+        // --- INT4 MoE dispatch (pre-converted Q2_K → INT4 + MTL4 matmul) ---
+        if (ds4_gpu_get_tensor_mm_i4_pipeline() && n_tokens >= 32u && !g_quality_mode) {
+            id<MTLBuffer> i4b = nil; float *i4s = NULL; uint64_t eb = 0;
+            for (int s=0; s<g_n_expert_i4_shadows; s++) {
+                if (g_expert_i4_shadows[s].base_offset == gate_offset) {
+                    i4b=g_expert_i4_shadows[s].i4_buf; i4s=g_expert_i4_shadows[s].scale;
+                    eb=g_expert_i4_shadows[s].expert_bytes; break;
+                }
+            }
+            if (i4b && i4s) {
+                id<MTLComputePipelineState> pl = ds4_gpu_get_tensor_mm_i4_pipeline();
+                if (pl) {
+                    int owned=0; id<MTLCommandBuffer> cb=ds4_gpu_command_buffer(&owned);
+                    if (!cb) return 0;
+                    ds4_gpu_mul_mm_args ga=ds4_gpu_make_mm_args(expert_in_dim,expert_mid_dim,n_tokens,eb*2);
+                    uint64_t eo_sz=(uint64_t)n_tokens*expert_mid_dim*sizeof(float);
+                    for (uint32_t e=0; e<n_expert; e++) {
+                        float s=i4s[e]; ga.post_scale=s;
+                        ds4_gpu_i4_moe_dispatch(cb,pl,&ga,sizeof(ga),&s,false,i4b,(NSUInteger)(e*eb),
+                            expert_in_dim,expert_mid_dim,xbuf,ds4_gpu_tensor_offset(x),
+                            gatebuf,(NSUInteger)(ds4_gpu_tensor_offset(gate)+e*eo_sz),n_tokens);
+                        ds4_gpu_i4_moe_dispatch(cb,pl,&ga,sizeof(ga),&s,false,i4b,(NSUInteger)(e*eb),
+                            expert_in_dim,expert_mid_dim,xbuf,ds4_gpu_tensor_offset(x),
+                            upbuf,(NSUInteger)(ds4_gpu_tensor_offset(up)+e*eo_sz),n_tokens);
+                    }
+                    uint32_t pr=n_tokens*n_expert;
+                    if (ds4_gpu_encode_moe_swiglu_weight(cb,gatebuf,ds4_gpu_tensor_offset(gate),
+                            upbuf,ds4_gpu_tensor_offset(up),midbuf,ds4_gpu_tensor_offset(mid),
+                            weightsbuf,ds4_gpu_tensor_offset(weights),expert_mid_dim,pr,
+                            clamp,false)) {
+                        ds4_gpu_mul_mm_args da=ds4_gpu_make_mm_args(expert_mid_dim,out_dim,n_tokens,eb*2);
+                        for (uint32_t e=0; e<n_expert; e++) {
+                            float s=1.0f; da.post_scale=1.0f;
+                            ds4_gpu_i4_moe_dispatch(cb,pl,&da,sizeof(da),&s,false,i4b,(NSUInteger)(e*eb),
+                                expert_mid_dim,out_dim,midbuf,(NSUInteger)(ds4_gpu_tensor_offset(mid)+e*(uint64_t)n_tokens*expert_mid_dim*sizeof(float)),
+                                outbuf,ds4_gpu_tensor_offset(out),n_tokens);
+                        }
+                    }
+                    if(mid_is_f16)*mid_is_f16=false;
+                    if(!ds4_gpu_finish_command_buffer(cb,owned,"MoE INT4"))return 0;
+                    return 1;
+                }
+            }
+        }
+
         if (use_mm_id) {
             gate_map_args =
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, 256, 1, n_expert, n_tokens);
@@ -15619,6 +15773,255 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "shared-down HC expand fused")) return 0;
     }
 
+    return 1;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_get_tensor_mm_i8_pipeline(void) {
+    if (!g_has_tensor_accel) return nil;
+    NSString *key = @"kernel_tensor_mm_i8_f32";
+    id<MTLComputePipelineState> c = [g_pipeline_cache objectForKey:key];
+    if (c) return c;
+    id<MTLFunction> fn = [g_tensor_library newFunctionWithName:key];
+    if (!fn) return nil;
+    NSError *err = nil;
+    id<MTLComputePipelineState> pl = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pl) return nil;
+    [g_pipeline_cache setObject:pl forKey:key];
+    return pl;
+}
+
+// --- Batched ANE dispatch (one MTL4 encoder per layer) ---
+int ds4_gpu_ane_batch_begin(void) {
+    if (!g_has_tensor_accel || !@available(macOS 26.0, *)) return 0;
+    @try {
+        if (!g_ane_al) g_ane_al = [g_device newCommandAllocator];
+        if (!g_ane_al) return 0;
+        g_ane_cb = [g_device newCommandBuffer];
+        if (!g_ane_cb) return 0;
+        [g_ane_cb beginCommandBufferWithAllocator:g_ane_al];
+        g_ane_en = [g_ane_cb computeCommandEncoder];
+        if (!g_ane_en) return 0;
+        if (!g_ane_at) {
+            MTL4ArgumentTableDescriptor *d = [MTL4ArgumentTableDescriptor new];
+            d.maxBufferBindCount = 4;
+            g_ane_at = [g_device newArgumentTableWithDescriptor:d error:nil];
+            if (!g_ane_at) return 0;
+        }
+        g_ane_active = true;
+        return 1;
+    } @catch (NSException *e) { return 0; }
+}
+int ds4_gpu_ane_batch_end(void) {
+    if (!g_ane_active) return 0;
+    g_ane_active = false;
+    [g_ane_en endEncoding]; g_ane_en = nil;
+    [g_ane_cb endCommandBuffer];
+    if ([g_queue conformsToProtocol:@protocol(MTL4CommandQueue)])
+        [(id<MTL4CommandQueue>)g_queue commit:&g_ane_cb count:1];
+    g_ane_cb = nil;
+    return 1;
+}
+
+int ds4_gpu_ane_batch_flush(void) {
+    int r = ds4_gpu_ane_batch_end();
+    if (r) r = ds4_gpu_ane_batch_begin();
+    return r;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_get_tensor_mm_i4_pipeline(void) {
+    if (!g_has_tensor_accel) return nil;
+    NSString *key = @"kernel_tensor_mm_i4_f32";
+    id<MTLComputePipelineState> c = [g_pipeline_cache objectForKey:key];
+    if (c) return c;
+    id<MTLFunction> fn = [g_tensor_library newFunctionWithName:key];
+    if (!fn) return nil;
+    NSError *err = nil;
+    id<MTLComputePipelineState> pl = [g_device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pl) return nil;
+    [g_pipeline_cache setObject:pl forKey:key];
+    return pl;
+}
+
+static int ds4_gpu_i4_moe_dispatch(
+        id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pl,
+        const void *args, size_t args_len, float *ps,
+        bool is_int8,
+        id<MTLBuffer> wbuf, NSUInteger woff, uint64_t in_dim, uint64_t out_dim,
+        id<MTLBuffer> xbuf, NSUInteger xoff,
+        id<MTLBuffer> outbuf, NSUInteger outoff, uint64_t n_tok) {
+    MTLTensorDataType wdt = is_int8 ? MTLTensorDataTypeInt8 : MTLTensorDataTypeInt4;
+    if (g_ane_active) {
+        @autoreleasepool {
+            NSInteger wd[2]={(NSInteger)in_dim,(NSInteger)out_dim}, ws[2]={1,(NSInteger)in_dim};
+            MTLTensorDescriptor *wdsc=[MTLTensorDescriptor new];
+            wdsc.dataType=wdt; wdsc.usage=MTLTensorUsageCompute;
+            wdsc.dimensions=[[MTLTensorExtents alloc] initWithRank:2 values:wd];
+            wdsc.strides=[[MTLTensorExtents alloc] initWithRank:2 values:ws];
+            id<MTLTensor> wt=[wbuf newTensorWithDescriptor:wdsc offset:woff error:nil];
+            if(!wt)return 0;
+            NSUInteger xh_bytes=(NSUInteger)(n_tok*in_dim*sizeof(uint16_t));
+            id<MTLBuffer> hb=[g_device newBufferWithLength:xh_bytes options:MTLResourceStorageModeShared];
+            if(!hb)return 0;
+            {uint16_t*xh=(uint16_t*)[hb contents]; const float*fx=(const float*)((uint8_t*)[xbuf contents]+xoff);
+            for(uint64_t i=0;i<n_tok*in_dim;i++){float v=fx[i]; uint32_t b=*(uint32_t*)&v;
+            xh[i]=(uint16_t)((b>>16)&0x8000); int e=((int)(b>>23)&0xff)-112;
+            if(e>0&&e<=0x1f)xh[i]|=(uint16_t)(e<<10)|(uint16_t)((b>>13)&0x3ff); else if(e>0x1f)xh[i]|=(uint16_t)0x7c00;}}
+            NSInteger xd[2]={(NSInteger)in_dim,(NSInteger)n_tok}, xs2[2]={1,(NSInteger)in_dim};
+            MTLTensorDescriptor *xdsc=[MTLTensorDescriptor new];
+            xdsc.dataType=MTLTensorDataTypeFloat16; xdsc.usage=MTLTensorUsageCompute;
+            xdsc.dimensions=[[MTLTensorExtents alloc] initWithRank:2 values:xd];
+            xdsc.strides=[[MTLTensorExtents alloc] initWithRank:2 values:xs2];
+            id<MTLTensor> xt=[hb newTensorWithDescriptor:xdsc offset:0 error:nil];
+            if(!xt)return 0;
+            NSInteger cd[2]={(NSInteger)out_dim,(NSInteger)n_tok}, cs2[2]={1,(NSInteger)out_dim};
+            MTLTensorDescriptor *cdsc=[MTLTensorDescriptor new];
+            cdsc.dataType=MTLTensorDataTypeFloat32; cdsc.usage=MTLTensorUsageCompute;
+            cdsc.dimensions=[[MTLTensorExtents alloc] initWithRank:2 values:cd];
+            cdsc.strides=[[MTLTensorExtents alloc] initWithRank:2 values:cs2];
+            id<MTLTensor> ct=[outbuf newTensorWithDescriptor:cdsc offset:outoff error:nil];
+            if(!ct)return 0;
+            id<MTLBuffer> ab=[g_device newBufferWithLength:args_len options:MTLResourceStorageModeShared];
+            if(!ab)return 0; memcpy([ab contents],args,args_len);
+            [g_ane_at setAddress:[ab gpuAddress] atIndex:0];
+            [g_ane_at setResource:[wt gpuResourceID] atBufferIndex:1];
+            [g_ane_at setResource:[xt gpuResourceID] atBufferIndex:2];
+            [g_ane_at setResource:[ct gpuResourceID] atBufferIndex:3];
+            [g_ane_en setComputePipelineState:pl]; [g_ane_en setArgumentTable:g_ane_at];
+            [g_ane_en dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim+31)/32,((NSUInteger)n_tok+63)/64,1)
+                      threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+        }
+        return 1;
+    }
+
+    if (@available(macOS 26.0, *)) {
+        @try {
+            id<MTL4CommandBuffer> cb4 = [g_device newCommandBuffer];
+            if (!cb4) return 0;
+            id<MTL4CommandAllocator> al = [g_device newCommandAllocator];
+            if (!al) return 0;
+            [cb4 beginCommandBufferWithAllocator:al];
+            NSInteger wd[2]={(NSInteger)in_dim,(NSInteger)out_dim}, ws[2]={1,(NSInteger)in_dim};
+            MTLTensorDescriptor *wdsc=[MTLTensorDescriptor new];
+            wdsc.dataType=wdt; wdsc.usage=MTLTensorUsageCompute;
+            wdsc.dimensions=[[MTLTensorExtents alloc] initWithRank:2 values:wd];
+            wdsc.strides=[[MTLTensorExtents alloc] initWithRank:2 values:ws];
+            id<MTLTensor> wt=[wbuf newTensorWithDescriptor:wdsc offset:woff error:nil];
+            if(!wt)return 0;
+            NSUInteger xh_bytes=(NSUInteger)(n_tok*in_dim*sizeof(uint16_t));
+            id<MTLBuffer> xh_buf=[g_device newBufferWithLength:xh_bytes options:MTLResourceStorageModeShared];
+            if(!xh_buf)return 0;
+            {uint16_t *xh=(uint16_t*)[xh_buf contents]; const float *xf=(const float*)((uint8_t*)[xbuf contents]+xoff);
+            for(uint64_t i=0;i<n_tok*in_dim;i++){float v=xf[i]; uint32_t b=*(uint32_t*)&v;
+            xh[i]=(uint16_t)((b>>16)&0x8000); int e=((int)(b>>23)&0xff)-112;
+            if(e>0&&e<=0x1f)xh[i]|=(uint16_t)(e<<10)|(uint16_t)((b>>13)&0x3ff);
+            else if(e>0x1f)xh[i]|=(uint16_t)0x7c00;}}
+            NSInteger xd[2]={(NSInteger)in_dim,(NSInteger)n_tok}, xs2[2]={1,(NSInteger)in_dim};
+            MTLTensorDescriptor *xdsc=[MTLTensorDescriptor new];
+            xdsc.dataType=MTLTensorDataTypeFloat16; xdsc.usage=MTLTensorUsageCompute;
+            xdsc.dimensions=[[MTLTensorExtents alloc] initWithRank:2 values:xd];
+            xdsc.strides=[[MTLTensorExtents alloc] initWithRank:2 values:xs2];
+            id<MTLTensor> xt=[xh_buf newTensorWithDescriptor:xdsc offset:0 error:nil];
+            if(!xt)return 0;
+            NSInteger cd[2]={(NSInteger)out_dim,(NSInteger)n_tok}, cs2[2]={1,(NSInteger)out_dim};
+            MTLTensorDescriptor *cdsc=[MTLTensorDescriptor new];
+            cdsc.dataType=MTLTensorDataTypeFloat32; cdsc.usage=MTLTensorUsageCompute;
+            cdsc.dimensions=[[MTLTensorExtents alloc] initWithRank:2 values:cd];
+            cdsc.strides=[[MTLTensorExtents alloc] initWithRank:2 values:cs2];
+            id<MTLTensor> ct=[outbuf newTensorWithDescriptor:cdsc offset:outoff error:nil];
+            if(!ct)return 0;
+            id<MTLBuffer> abuf=[g_device newBufferWithLength:args_len options:MTLResourceStorageModeShared];
+            if(!abuf)return 0; memcpy([abuf contents],args,args_len);
+            MTL4ArgumentTableDescriptor *atd=[MTL4ArgumentTableDescriptor new];
+            atd.maxBufferBindCount=4;
+            id<MTL4ArgumentTable> at=[g_device newArgumentTableWithDescriptor:atd error:nil];
+            if(!at)return 0;
+            [at setAddress:[abuf gpuAddress] atIndex:0];
+            [at setResource:[wt gpuResourceID] atBufferIndex:1];
+            [at setResource:[xt gpuResourceID] atBufferIndex:2];
+            [at setResource:[ct gpuResourceID] atBufferIndex:3];
+            id<MTL4ComputeCommandEncoder> enc4=[cb4 computeCommandEncoder];
+            if(!enc4)return 0;
+            [enc4 setComputePipelineState:pl]; [enc4 setArgumentTable:at];
+            [enc4 dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim+31)/32,((NSUInteger)n_tok+63)/64,1)
+                  threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+            [enc4 endEncoding]; [cb4 endCommandBuffer];
+            if([g_queue conformsToProtocol:@protocol(MTL4CommandQueue)])
+                [(id<MTL4CommandQueue>)g_queue commit:&cb4 count:1];
+            return 1;
+        }@catch(NSException *e){return 0;}
+    }
+    return 0;
+}
+
+// GPU Q2_K → INT4 pre-conversion at model load time.
+int ds4_gpu_cache_expert_i4_range(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes,
+        uint64_t in_dim, uint64_t out_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!model_map || !bytes) return 1;
+    if ((in_dim & 255u) != 0 || in_dim < 256) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+
+    const uint64_t blocks_per_row = in_dim / 256u;
+    const uint64_t row_bytes = blocks_per_row * 84u;
+    const uint64_t n_expert = bytes / (out_dim * row_bytes);
+    if (n_expert == 0 || n_expert > 256) return 1;
+    const uint64_t one_expert_elems = in_dim * out_dim;
+    const uint64_t blocks_per_expert = one_expert_elems / 256u;
+    const uint64_t packed_bytes = one_expert_elems / 2u;
+
+    id<MTLBuffer> i4_buf = [g_device newBufferWithLength:(NSUInteger)(n_expert * packed_bytes)
+                                                  options:MTLResourceStorageModeShared];
+    if (!i4_buf) return 0;
+    float *scales = malloc((size_t)n_expert * sizeof(float));
+    if (!scales) return 0;
+    uint64_t src_inner = 0;
+    id<MTLBuffer> src_buf = ds4_gpu_wrap_model_range(model_map, model_size, offset, bytes, &src_inner);
+    if (!src_buf) { free(scales); return 0; }
+
+    for (uint64_t e = 0; e < n_expert; e++) {
+        uint64_t e_src_off = src_inner + e * out_dim * row_bytes;
+        uint64_t e_dst_off = e * packed_bytes;
+
+        id<MTLBuffer> am_buf = [g_device newBufferWithLength:(NSUInteger)(blocks_per_expert * sizeof(float))
+                                                      options:MTLResourceStorageModeShared];
+        if (!am_buf) { free(scales); return 0; }
+        {
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:g_q2k_to_i4_step1_pipeline];
+            [enc setBuffer:src_buf offset:(NSUInteger)e_src_off atIndex:0];
+            [enc setBuffer:am_buf  offset:0 atIndex:1];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)blocks_per_expert, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            [enc endEncoding];
+            [cb commit]; [cb waitUntilCompleted];
+        }
+        float max_abs = 1e-8f;
+        const float *am = (const float *)[am_buf contents];
+        for (uint64_t i = 0; i < blocks_per_expert; i++)
+            if (am[i] > max_abs) max_abs = am[i];
+        float s = max_abs / 7.0f;
+        scales[e] = s;
+
+        {
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:g_q2k_to_i4_step2_pipeline];
+            [enc setBuffer:src_buf offset:(NSUInteger)e_src_off atIndex:0];
+            [enc setBuffer:i4_buf  offset:(NSUInteger)e_dst_off atIndex:1];
+            [enc setBytes:&s length:sizeof(float) atIndex:2];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)blocks_per_expert, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+            [enc endEncoding];
+            [cb commit]; [cb waitUntilCompleted];
+        }
+    }
+
+    // Store in shadow table for MoE dispatch
+    // (shadow table globals and redirect not yet implemented - follow-on)
+    free(scales);
     return 1;
 }
 

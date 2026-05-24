@@ -1482,8 +1482,34 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
 }
 #else
 static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
-    (void)backend;
-    (void)m;
+    if (backend != DS4_BACKEND_METAL) return true;
+    if (!m || !m->map || m->size == 0) return false;
+    if (getenv("DS4_METAL_I4_PRELOAD") == NULL) return true;
+
+    const double t0 = now_sec();
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+        if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2) {
+            char label[128];
+            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+            if (ds4_gpu_cache_q8_i8_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+                fprintf(stderr, "ds4: Metal failed to convert Q8 tensor %.*s to INT8\n", (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            n++;
+        }
+        if (t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS || t->type == DS4_TENSOR_Q4_K) {
+            if (ds4_gpu_cache_expert_i4_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1]) == 0) {
+                fprintf(stderr, "ds4: Metal failed to convert expert %.*s to INT4\n", (int)t->name.len, t->name.ptr);
+                return false;
+            }
+            n++;
+        }
+    }
+    if (n > 0) fprintf(stderr, "ds4: converted %" PRIu64 " expert tensors to INT4 in %.3fs\n", n, now_sec() - t0);
     return true;
 }
 #endif
@@ -11461,7 +11487,7 @@ static bool metal_graph_encode_layer_attention_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
-
+    (void)ds4_gpu_ane_batch_begin();
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -12826,6 +12852,7 @@ static bool metal_graph_encode_layer_attention_batch(
     free(comp_counts);
 #undef DS4_METAL_PROFILE_ATTN_STAGE
 #undef DS4_METAL_PROFILE_Q_STAGE
+    (void)ds4_gpu_ane_batch_end();
     return ok;
 }
 
@@ -12839,6 +12866,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         uint32_t                pos0,
         uint32_t                n_tokens) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
+    (void)ds4_gpu_ane_batch_begin();
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
@@ -13102,6 +13130,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
 #undef DS4_METAL_PROFILE_FFN_STAGE
+    (void)ds4_gpu_ane_batch_end();
     return ok;
 }
 
@@ -17732,7 +17761,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
+        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);

@@ -1079,7 +1079,8 @@ kernel void kernel_mul_mm_mpp_direct_rhs(
     threadgroup SA *sa = (threadgroup SA *)shmem;
     auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
 
-    device T1 *ptrB = (device T1 *)(srcB + args.nb12*i12 + args.nb13*i13);
+    device char *srcB_nc = (device char *)srcB;
+    device T1 *ptrB = (device T1 *)(srcB_nc + args.nb12*i12 + args.nb13*i13);
     const int strideB = args.nb11/sizeof(T1);
     auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
 

@@ -858,6 +858,203 @@ kernel void kernel_dsv4_q8_hc_expand4_q8_0(
     }
 }
 
+// Decode-time attention output tail fusion for FP16 attn_output_b weights.
+kernel void kernel_dsv4_f16_hc_expand4_f16(
+        constant ds4_metal_args_mul_mv        & mv,
+        constant ds4_metal_args_dsv4_hc_expand & hc,
+        device  const char * weight,
+        device  const char * input,
+        device        char * block_out,
+        device  const char * residual,
+        device  const char * post,
+        device  const char * comb,
+        device        char * dst,
+        threadgroup   char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (hc.n_hc != 4 || hc.n_tokens != 1) {
+        return;
+    }
+
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 16;
+    constexpr short NF4 = NF / 4;
+
+    const int nb = mv.ne00 / NB;
+    const int row0 = tgpig.x * mv.nr0;
+
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+
+    device const float  *y  = (device const float  *)(input);
+    device const float4 *y4 = (device const float4 *)(input);
+    device const float4 *yb4 = y4 + (ib0 * NB + il * NF) / 4;
+
+    device const half  *ax0 = (device const half  *)(weight + (uint64_t)(row0 + 0) * mv.nb01);
+    device const half4 *ax40 = (device const half4 *)(weight + (uint64_t)(row0 + 0) * mv.nb01);
+    device const half  *ax1 = (device const half  *)(weight + (uint64_t)(row0 + 1) * mv.nb01);
+    device const half4 *ax41 = (device const half4 *)(weight + (uint64_t)(row0 + 1) * mv.nb01);
+    device const half  *ax2 = (device const half  *)(weight + (uint64_t)(row0 + 2) * mv.nb01);
+    device const half4 *ax42 = (device const half4 *)(weight + (uint64_t)(row0 + 2) * mv.nb01);
+    device const half  *ax3 = (device const half  *)(weight + (uint64_t)(row0 + 3) * mv.nb01);
+    device const half4 *ax43 = (device const half4 *)(weight + (uint64_t)(row0 + 3) * mv.nb01);
+
+    if (mv.nr0 <= 2) {
+        float sumf2[2] = { 0.0f, 0.0f };
+
+        for (int ib = ib0; ib < nb; ib += NSG * NF) {
+            float4 yl4[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[i];
+            }
+
+            FOR_UNROLL (short row = 0; row < 2; ++row) {
+                device const half4 *xb4 =
+                    (row == 0 ? ax40 : ax41) + (ib * NB + il * NF) / 4;
+                float sumq = 0.0f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(float4(xb4[i]), yl4[i]);
+                }
+                sumf2[row] += sumq;
+            }
+
+            yb4 += (NSG * NF * NW) / 4;
+        }
+
+        for (int i = nb * NB + sgitg * NW + tiisg; i < mv.ne00; i += NW * NSG) {
+            sumf2[0] += (float)ax0[i] * y[i];
+            sumf2[1] += (float)ax1[i] * y[i];
+        }
+
+        threadgroup float *shmem_f32[2];
+        FOR_UNROLL (short row = 0; row < 2; ++row) {
+            shmem_f32[row] = (threadgroup float *)shmem + NW * row;
+            if (sgitg == 0) {
+                shmem_f32[row][tiisg] = 0.0f;
+            }
+            sumf2[row] = simd_sum(sumf2[row]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short row = 0; row < 2; ++row) {
+            if (tiisg == 0) {
+                shmem_f32[row][sgitg] = sumf2[row];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short row = 0; row < 2; ++row) {
+            const int d = row0 + row;
+            if (d >= mv.ne01) {
+                continue;
+            }
+
+            const float block_v = simd_sum(shmem_f32[row][tiisg]);
+            if (tiisg == 0 && sgitg == 0) {
+                *((device float *)(block_out + (uint64_t)d * sizeof(float))) = block_v;
+
+                const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+                const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+                const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+                const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+                for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                    float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+
+                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+                    acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+
+                    *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+                }
+            }
+        }
+        return;
+    }
+
+    float sumf4[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    device const half4 *ax4[4] = { ax40, ax41, ax42, ax43 };
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        float4 yl4[NF4];
+        FOR_UNROLL (short i = 0; i < NF4; ++i) {
+            yl4[i] = yb4[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < 4; ++row) {
+            device const half4 *xb4 = ax4[row] + (ib * NB + il * NF) / 4;
+            float sumq = 0.0f;
+            FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                sumq += dot(float4(xb4[i]), yl4[i]);
+            }
+            sumf4[row] += sumq;
+        }
+
+        yb4 += (NSG * NF * NW) / 4;
+    }
+
+    for (int i = nb * NB + sgitg * NW + tiisg; i < mv.ne00; i += NW * NSG) {
+        sumf4[0] += (float)ax0[i] * y[i];
+        sumf4[1] += (float)ax1[i] * y[i];
+        sumf4[2] += (float)ax2[i] * y[i];
+        sumf4[3] += (float)ax3[i] * y[i];
+    }
+
+    threadgroup float *shmem_f32[4];
+    FOR_UNROLL (short row = 0; row < 4; ++row) {
+        shmem_f32[row] = (threadgroup float *)shmem + NW * row;
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+        sumf4[row] = simd_sum(sumf4[row]);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL (short row = 0; row < 4; ++row) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf4[row];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL (short row = 0; row < 4; ++row) {
+        const int d = row0 + row;
+        if (d >= mv.ne01) {
+            continue;
+        }
+
+        const float block_v = simd_sum(shmem_f32[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            *((device float *)(block_out + (uint64_t)d * sizeof(float))) = block_v;
+
+            const float r0 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 0 * hc.nb_res1));
+            const float r1 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 1 * hc.nb_res1));
+            const float r2 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 2 * hc.nb_res1));
+            const float r3 = *((device const float *)(residual + (uint64_t)d * hc.nb_res0 + 3 * hc.nb_res1));
+
+            for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+                float acc = block_v * *((device const float *)(post + dst_hc * hc.nb_post0));
+
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 0 * hc.nb_comb1)) * r0;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 1 * hc.nb_comb1)) * r1;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 2 * hc.nb_comb1)) * r2;
+                acc += *((device const float *)(comb + dst_hc * hc.nb_comb0 + 3 * hc.nb_comb1)) * r3;
+
+                *((device float *)(dst + (uint64_t)d * hc.nb0 + dst_hc * hc.nb1)) = acc;
+            }
+        }
+    }
+}
+
 // Reduces HC channels to a normal embedding row with the learned pre weights.
 // This is the input adapter before the attention block and before the FFN block.
 kernel void kernel_dsv4_hc_weighted_sum(

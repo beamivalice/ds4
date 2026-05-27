@@ -817,6 +817,9 @@ static int ds4_gpu_prefill_baseline_mode(void) {
 }
 
 static int ds4_gpu_prefill_opt_moe_wide_tiles(void) {
+    if (getenv("DS4_METAL_DISABLE_PREFILL_MOE_WIDE_TILES") != NULL) {
+        return 0;
+    }
     if (!ds4_gpu_prefill_baseline_mode()) {
         return 1;
     }
@@ -824,6 +827,9 @@ static int ds4_gpu_prefill_opt_moe_wide_tiles(void) {
 }
 
 static int ds4_gpu_prefill_opt_moe_gate_up_pair(void) {
+    if (getenv("DS4_METAL_DISABLE_MOE_GATE_UP_PAIR") != NULL) {
+        return 0;
+    }
     if (!ds4_gpu_prefill_baseline_mode()) {
         return 1;
     }
@@ -831,6 +837,9 @@ static int ds4_gpu_prefill_opt_moe_gate_up_pair(void) {
 }
 
 static int ds4_gpu_prefill_opt_flash_nwg64(void) {
+    if (getenv("DS4_METAL_DISABLE_PREFILL_FLASH_NWG64") != NULL) {
+        return 0;
+    }
     if (!ds4_gpu_prefill_baseline_mode()) {
         return 1;
     }

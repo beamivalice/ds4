@@ -1,0 +1,26 @@
+ablate: === baseline ===
+ablate: === only_moe_wide_tiles ===
+ablate: === only_moe_gate_up_pair ===
+ablate: === only_flash_nwg64 ===
+ablate: === full ===
+ablate: === no_moe_wide_tiles ===
+ablate: === no_moe_gate_up_pair ===
+ablate: === no_flash_nwg64 ===
+ablate: === baseline_legacy_moe_flash ===
+
+Wrote /Users/beam/llm/ds4main/speed-bench/port_matrix.csv
+
+=== Enable-one vs baseline (PREFILL_BASELINE=1) ===
+
+  baseline                   456.2 (+0.0 @2048)    405.2 (+0.0 @8192)
+  only_moe_wide_tiles        660.6 (+204.5 @2048)    489.6 (+84.4 @8192)
+  only_moe_gate_up_pair      436.3 (-19.9 @2048)    345.8 (-59.4 @8192)
+  only_flash_nwg64           467.1 (+10.9 @2048)    316.5 (-88.6 @8192)
+  full                       663.1 (+206.9 @2048)    435.3 (+30.2 @8192)
+
+=== Leave-one-out from full (Δ when feature disabled) ===
+
+  MoE wide tiles          +216.3 @2048    +108.8 @8192
+  Q4_K gate+up pair         +1.8 @2048      -9.1 @8192
+  flash nwg=64              -0.3 @2048      -6.0 @8192
+ablate: wrote /Users/beam/llm/ds4main/speed-bench/prefill_ablation.csv and /Users/beam/llm/ds4main/speed-bench/port_matrix.csv
